@@ -1,511 +1,492 @@
 import os
 import base64
-import json
-import time
-from datetime import datetime
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from email.mime.text import MIMEText
-import pickle
-import tempfile
-import anthropic
+import email
 import re
+import imaplib
+from email.header import decode_header
+import anthropic
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import gspread
+import tempfile
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import logging
+import datetime
+import json
+import PyPDF2
+import docx
+import csv
+import io
 
-# Google API scopes
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-# Configuration - replace with your values
-EMAIL_LABEL = "ai-receipts"  # The Gmail label/group to search for
-SENDER_EMAIL = "paul@paulhauner.com"  # Your email address
+# Configuration
+SERVICE_ACCOUNT_FILE = (
+    "./credentials/service-account.json"  # Path to your service account credentials
+)
+GOOGLE_GROUP_EMAIL = "ai-receipts@paulhauner.com"  # Your Google Group email
 SPREADSHEET_ID = "1oM5APBsN7JqADj71VHLp14BVwaOd5Azx9g3m_Cm5B8M"  # Google Sheet ID
-SHEET_NAME = "Transactions"  # Sheet name in your Google Spreadsheet
-TRACKING_SHEET_NAME = "ProcessedEmails"  # Sheet to track processed emails
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # Set as environment variable
+WORKSHEET_NAME = "Transactions"  # Name of the worksheet
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # Anthropic API key
+
+# Gmail IMAP configuration
+GMAIL_EMAIL = "haunereceipts@gmail.com"  # Your dedicated Gmail account
+GMAIL_PASSWORD = os.environ.get(
+    "GMAIL_APP_PASSWORD"
+)  # App password for Gmail (not your regular password)
+GMAIL_IMAP_SERVER = "imap.gmail.com"
+GMAIL_SMTP_SERVER = "smtp.gmail.com"
+GMAIL_SMTP_PORT = 587
+FORWARDING_EMAIL = "paul@paulhauner.com"  # Email to forward summaries to
 
 
-def get_credentials():
-    """Get and refresh Google API credentials"""
-    creds = None
-    if os.path.exists("token.pickle"):
-        with open("token.pickle", "rb") as token:
-            creds = pickle.load(token)
+class InvoiceProcessor:
+    def __init__(self):
+        # Set up Google Sheets access via service account
+        self.credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        self.gc = gspread.authorize(self.credentials)
+        self.spreadsheet = self.gc.open_by_key(SPREADSHEET_ID)
+        self.worksheet = self.spreadsheet.worksheet(WORKSHEET_NAME)
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local(port=0)
-        with open("token.pickle", "wb") as token:
-            pickle.dump(creds, token)
+        # Set up Anthropic client
+        self.anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    return creds
+    def connect_to_gmail(self):
+        """Connect to Gmail via IMAP."""
+        try:
+            mail = imaplib.IMAP4_SSL(GMAIL_IMAP_SERVER)
+            mail.login(GMAIL_EMAIL, GMAIL_PASSWORD)
+            return mail
+        except Exception as e:
+            logger.error(f"Error connecting to Gmail: {e}")
+            return None
 
+    def get_unread_emails(self):
+        """Retrieve unread emails from Gmail."""
+        mail = self.connect_to_gmail()
+        if not mail:
+            return []
 
-def get_email_content(service, message_id):
-    """Get email content and attachments"""
-    message = service.users().messages().get(userId="me", id=message_id).execute()
+        try:
+            mail.select("inbox")
+            status, messages = mail.search(None, "UNSEEN")
 
-    # Extract email body
-    email_body = ""
-    if "payload" in message:
-        if "body" in message["payload"] and message["payload"]["body"].get("data"):
-            body_data = message["payload"]["body"]["data"]
-            email_body = base64.urlsafe_b64decode(body_data).decode("utf-8")
-        elif "parts" in message["payload"]:
-            for part in message["payload"]["parts"]:
-                if part.get("mimeType") == "text/plain" and part.get("body", {}).get(
-                    "data"
-                ):
-                    body_data = part["body"]["data"]
-                    email_body = base64.urlsafe_b64decode(body_data).decode("utf-8")
-                    break
+            if status != "OK":
+                logger.error("Error searching for emails")
+                return []
 
-    # Extract subject
-    headers = message["payload"]["headers"]
-    subject = next(
-        (h["value"] for h in headers if h["name"] == "Subject"), "No Subject"
-    )
+            message_ids = messages[0].split()
+            logger.info(f"Found {len(message_ids)} unread emails.")
 
-    # Extract attachments
-    attachments = []
+            return mail, message_ids
+        except Exception as e:
+            logger.error(f"Error retrieving emails: {e}")
+            mail.logout()
+            return []
 
-    if "payload" in message and "parts" in message["payload"]:
-        parts = message["payload"].get("parts", [])
-
-        for part in parts:
-            if (
-                part.get("filename")
-                and part.get("body")
-                and part.get("body").get("attachmentId")
-            ):
-                attachment = (
-                    service.users()
-                    .messages()
-                    .attachments()
-                    .get(
-                        userId="me",
-                        messageId=message_id,
-                        id=part["body"]["attachmentId"],
-                    )
-                    .execute()
-                )
-
-                file_data = base64.urlsafe_b64decode(attachment["data"])
-                temp_file = tempfile.NamedTemporaryFile(
-                    delete=False, suffix=part["filename"]
-                )
-                temp_file.write(file_data)
-                temp_file.close()
-
-                attachments.append(
-                    {
-                        "filename": part["filename"],
-                        "filepath": temp_file.name,
-                        "mimetype": part.get("mimeType", ""),
-                    }
-                )
-
-    return {"subject": subject, "body": email_body, "attachments": attachments}
-
-
-def process_with_anthropic(email_content, attachments):
-    """Send email content and files to Anthropic API and request JSON response"""
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    # Prepare the files for the API
-    media = [
-        {
-            "type": "text",
-            "text": f"Subject: {email_content['subject']}\n\nEmail Body:\n{email_content['body']}\n\nPlease analyze this email and any attached documents to extract financial information.",
-        }
-    ]
-
-    # Add attachments if available
-    for attachment in attachments:
-        with open(attachment["filepath"], "rb") as f:
-            file_content = f.read()
-            mime_type = attachment["mimetype"]
-            if not mime_type or mime_type == "":
-                # Try to guess MIME type from extension
-                if attachment["filename"].lower().endswith(".pdf"):
-                    mime_type = "application/pdf"
-                elif attachment["filename"].lower().endswith((".jpg", ".jpeg")):
-                    mime_type = "image/jpeg"
-                elif attachment["filename"].lower().endswith(".png"):
-                    mime_type = "image/png"
+    def decode_email_header(self, header):
+        """Decode email header."""
+        decoded_header = decode_header(header)
+        header_parts = []
+        for content, encoding in decoded_header:
+            if isinstance(content, bytes):
+                if encoding:
+                    header_parts.append(content.decode(encoding))
                 else:
-                    mime_type = "application/octet-stream"
+                    header_parts.append(content.decode("utf-8", errors="replace"))
+            else:
+                header_parts.append(content)
+        return "".join(header_parts)
 
-            media.append(
-                {
-                    "type": "file",
-                    "source": {
-                        "type": "base64",
-                        "media_type": mime_type,
-                        "data": base64.b64encode(file_content).decode("utf-8"),
-                    },
-                }
-            )
+    def extract_text_from_attachment(self, file_path, mime_type):
+        """Extract text from various file types."""
+        try:
+            text = ""
 
-    try:
-        system_prompt = """
-You analyze financial documents and extract structured data. Extract the following information:
-1. Date: The invoice/statement date (not today's date)
-2. Description: Brief description of the transaction
-3. Amount: Numeric value (positive for income, negative for expenses)
-4. Category: The type of expense or income (e.g., Rent Income, Utilities, Maintenance, Groceries, Salary)
-5. Property: If related to a property, include the property address, otherwise leave blank
+            # Process based on mime type
+            if mime_type == "application/pdf":
+                # Extract text from PDF
+                with open(file_path, "rb") as pdf_file:
+                    pdf_reader = PyPDF2.PdfReader(pdf_file)
+                    for page_num in range(len(pdf_reader.pages)):
+                        page = pdf_reader.pages[page_num]
+                        text += page.extract_text() + "\n\n"
 
-Return a valid JSON object with these fields. The JSON should be valid and parseable.
-Use negative amounts for expenses and positive amounts for income.
-Use the email body context to help categorize the transaction if needed.
+            elif (
+                mime_type
+                == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ):
+                # Extract text from DOCX
+                doc = docx.Document(file_path)
+                for para in doc.paragraphs:
+                    text += para.text + "\n"
+
+            elif mime_type == "text/plain":
+                # Extract text from plain text file
+                with open(file_path, "r", errors="replace") as txt_file:
+                    text = txt_file.read()
+
+            elif mime_type == "text/csv":
+                # Extract text from CSV
+                with open(file_path, "r", errors="replace") as csv_file:
+                    csv_reader = csv.reader(csv_file)
+                    for row in csv_reader:
+                        text += ", ".join(row) + "\n"
+
+            elif mime_type.startswith("image/"):
+                # For images, we can't extract text directly
+                text = "[This is an image attachment]"
+
+            else:
+                # For other file types
+                text = f"[Attachment of type {mime_type}]"
+
+            return text
+        except Exception as e:
+            logger.error(f"Error extracting text from attachment: {e}")
+            return f"[Error extracting text: {str(e)}]"
+
+    def get_email_content(self, mail, message_id):
+        """Get the content of an email, including attachments."""
+        try:
+            status, message_data = mail.fetch(message_id, "(RFC822)")
+
+            if status != "OK":
+                logger.error(f"Error fetching email with ID {message_id}")
+                return None
+
+            raw_email = message_data[0][1]
+            email_message = email.message_from_bytes(raw_email)
+
+            # Get email headers
+            subject = self.decode_email_header(email_message["Subject"] or "No Subject")
+            sender = self.decode_email_header(email_message["From"] or "Unknown Sender")
+            date = self.decode_email_header(email_message["Date"] or "")
+
+            # Process email body and attachments
+            body_content = ""
+            attachments = []
+
+            if email_message.is_multipart():
+                for part in email_message.walk():
+                    content_type = part.get_content_type()
+                    content_disposition = str(part.get("Content-Disposition"))
+
+                    if (
+                        content_type == "text/plain"
+                        and "attachment" not in content_disposition
+                    ):
+                        # Get the email body
+                        try:
+                            body = part.get_payload(decode=True)
+                            charset = part.get_content_charset() or "utf-8"
+                            body_content += body.decode(charset, errors="replace")
+                        except Exception as e:
+                            logger.error(f"Error decoding email body: {e}")
+
+                    elif "attachment" in content_disposition or part.get_filename():
+                        # This is an attachment
+                        filename = part.get_filename()
+                        if filename:
+                            # Decode filename if needed
+                            filename = self.decode_email_header(filename)
+
+                            # Get attachment content
+                            attachment_data = part.get_payload(decode=True)
+
+                            # Save attachment to a temporary file
+                            with tempfile.NamedTemporaryFile(
+                                delete=False, suffix=os.path.splitext(filename)[1]
+                            ) as temp:
+                                temp.write(attachment_data)
+                                attachments.append(
+                                    {
+                                        "filename": filename,
+                                        "path": temp.name,
+                                        "mime_type": part.get_content_type(),
+                                    }
+                                )
+            else:
+                # Not multipart - plain text email
+                try:
+                    body = email_message.get_payload(decode=True)
+                    charset = email_message.get_content_charset() or "utf-8"
+                    body_content = body.decode(charset, errors="replace")
+                except Exception as e:
+                    logger.error(f"Error decoding email body: {e}")
+
+            # Mark the message as read
+            mail.store(message_id, "+FLAGS", "\\Seen")
+
+            return {
+                "id": message_id.decode(),
+                "subject": subject,
+                "sender": sender,
+                "date": date,
+                "body": body_content,
+                "attachments": attachments,
+            }
+        except Exception as e:
+            logger.error(f"Error processing email {message_id}: {e}")
+            return None
+
+    def analyze_with_anthropic(self, email_content):
+        """Send email content and attachments to Anthropic API for analysis."""
+        try:
+            # Process and extract text from attachments
+            attachment_texts = []
+            for attachment in email_content["attachments"]:
+                try:
+                    # Extract text from the attachment
+                    extracted_text = self.extract_text_from_attachment(
+                        attachment["path"], attachment["mime_type"]
+                    )
+
+                    attachment_texts.append(
+                        {"filename": attachment["filename"], "content": extracted_text}
+                    )
+
+                    logger.info(
+                        f"Successfully extracted text from {attachment['filename']}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error extracting text from {attachment['filename']}: {e}"
+                    )
+                    attachment_texts.append(
+                        {
+                            "filename": attachment["filename"],
+                            "content": f"[Error extracting content: {str(e)}]",
+                        }
+                    )
+
+            # Prepare the prompt for Anthropic with email content
+            prompt = f"""
+I need you to analyze this email and any attachments related to rental property invoices or statements.
+Extract line items and categorize them appropriately for accounting purposes.
+
+EMAIL SUBJECT: {email_content['subject']}
+EMAIL DATE: {email_content['date']}
+EMAIL BODY:
+{email_content['body']}
+
 """
 
-        response = client.messages.create(
-            model="claude-3-7-sonnet-20250219",
-            max_tokens=4000,
-            system=system_prompt,
-            messages=[{"role": "user", "content": media}],
-        )
+            # Add attachment content to the prompt
+            for attachment in attachment_texts:
+                prompt += f"\n\nATTACHMENT: {attachment['filename']}\n"
+                prompt += f"CONTENT:\n{attachment['content']}\n"
 
-        # The response should be just JSON, but let's try to extract it if there's any wrapper text
-        content = response.content[0].text
+            prompt += """
+For each line item you identify, please provide:
+1. Date (in YYYY-MM-DD format)
+2. Description (what the charge or payment is for)
+3. Amount (negative for expenses, positive for income)
+4. Category (e.g., Utilities, Repairs, Rent)
+5. Property (if a specific property address is mentioned)
 
-        # Try to find JSON within the text if needed
-        try:
-            # First try direct parse
-            return json.loads(content)
-        except json.JSONDecodeError:
-            # Try to extract JSON if wrapped in markdown code blocks
-            json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", content)
+Format your response as JSON objects in the following structure:
+[
+  {
+    "date": "YYYY-MM-DD",
+    "description": "Description of item",
+    "amount": 123.45,
+    "category": "Category",
+    "property": "Property address or empty if not specified"
+  }
+]
+"""
+
+            # Log prompt size for debugging
+            logger.info(f"Prompt size: {len(prompt)} characters")
+
+            # Call Anthropic API
+            response = self.anthropic_client.messages.create(
+                model="claude-3-7-sonnet-20250219",
+                max_tokens=4000,
+                temperature=0,
+                system="You are an expert accountant specialized in processing rental property invoices and statements. Extract line items accurately, following the format instructions exactly.",
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            # Extract the JSON part from the response
+            # Attempt to find a JSON array in the response
+            json_match = re.search(
+                r"\[\s*\{.*?\}\s*\]", response.content[0].text, re.DOTALL
+            )
             if json_match:
-                return json.loads(json_match.group(1))
+                try:
+                    line_items = json.loads(json_match.group(0))
+                    return line_items
+                except json.JSONDecodeError:
+                    logger.error("Could not parse JSON from Anthropic response")
+                    logger.error(f"Raw response text: {response.content[0].text}")
+                    return []
             else:
-                raise Exception("Could not parse JSON from Anthropic response")
+                logger.error("No JSON data found in Anthropic response")
+                logger.error(f"Raw response text: {response.content[0].text}")
+                return []
 
-    except Exception as e:
-        raise Exception(f"Error processing with Anthropic: {str(e)}")
-
-
-def add_to_spreadsheet(creds, json_data):
-    """Add data from JSON to Google Sheets"""
-    service = build("sheets", "v4", credentials=creds)
-
-    # Ensure date is in the right format (YYYY-MM-DD)
-    try:
-        # Try to parse and standardize the date format
-        date_obj = None
-        date_formats = [
-            "%Y-%m-%d",
-            "%d/%m/%Y",
-            "%m/%d/%Y",
-            "%d-%m-%Y",
-            "%m-%d-%Y",
-            "%d.%m.%Y",
-            "%m.%d.%Y",
-            "%d %b %Y",
-            "%d %B %Y",
-        ]
-
-        for fmt in date_formats:
-            try:
-                date_obj = datetime.strptime(json_data["date"], fmt)
-                break
-            except (ValueError, TypeError):
-                continue
-
-        if date_obj:
-            formatted_date = date_obj.strftime("%Y-%m-%d")
-        else:
-            formatted_date = json_data.get("date", "")
-    except Exception:
-        formatted_date = json_data.get("date", "")
-
-    # Create a row with the data
-    row = [
-        formatted_date,  # Date
-        json_data.get("description", ""),  # Description
-        json_data.get("amount", 0),  # Amount
-        json_data.get("category", ""),  # Category
-        json_data.get("property", ""),  # Property
-    ]
-
-    # Append the row to the spreadsheet
-    result = (
-        service.spreadsheets()
-        .values()
-        .append(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{SHEET_NAME}!A:E",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": [row]},
-        )
-        .execute()
-    )
-
-    return result.get("updates").get("updatedRange")
-
-
-def check_if_processed(creds, message_id):
-    """Check if the email has already been processed"""
-    try:
-        service = build("sheets", "v4", credentials=creds)
-
-        # Check if tracking sheet exists, if not create it
-        try:
-            service.spreadsheets().values().get(
-                spreadsheetId=SPREADSHEET_ID, range=f"{TRACKING_SHEET_NAME}!A1"
-            ).execute()
-        except Exception:
-            # Create the tracking sheet with headers
-            body = {
-                "requests": [
-                    {"addSheet": {"properties": {"title": TRACKING_SHEET_NAME}}}
-                ]
-            }
-            service.spreadsheets().batchUpdate(
-                spreadsheetId=SPREADSHEET_ID, body=body
-            ).execute()
-
-            # Add headers
-            service.spreadsheets().values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"{TRACKING_SHEET_NAME}!A1:D1",
-                valueInputOption="USER_ENTERED",
-                body={
-                    "values": [
-                        ["MessageID", "ProcessedTimestamp", "EmailSubject", "Status"]
-                    ]
-                },
-            ).execute()
-
-        # Get all processed message IDs
-        result = (
-            service.spreadsheets()
-            .values()
-            .get(spreadsheetId=SPREADSHEET_ID, range=f"{TRACKING_SHEET_NAME}!A:A")
-            .execute()
-        )
-
-        values = result.get("values", [])
-
-        # Skip header row and check if message_id exists
-        processed_ids = [row[0] for row in values[1:]] if len(values) > 1 else []
-
-        return message_id in processed_ids
-
-    except Exception as e:
-        print(f"Error checking processed emails: {e}")
-        # If there's an error checking, assume not processed so we don't miss anything
-        return False
-
-
-def mark_as_processed(creds, message_id, subject, status="Success"):
-    """Mark email as processed in the tracking sheet"""
-    try:
-        service = build("sheets", "v4", credentials=creds)
-
-        # Add to tracking sheet
-        service.spreadsheets().values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{TRACKING_SHEET_NAME}!A:D",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={
-                "values": [
-                    [
-                        message_id,
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        subject,
-                        status,
-                    ]
-                ]
-            },
-        ).execute()
-
-        return True
-
-    except Exception as e:
-        print(f"Error marking as processed: {e}")
-        return False
-
-
-def send_email_summary(service, to_email, subject, body):
-    """Send an email summary"""
-    message = MIMEText(body)
-    message["to"] = to_email
-    message["subject"] = subject
-
-    raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-
-    try:
-        service.users().messages().send(
-            userId="me", body={"raw": raw_message}
-        ).execute()
-        return True
-    except Exception as e:
-        print(f"Error sending email: {e}")
-        return False
-
-
-def main():
-    """Main function to process invoices and financial emails"""
-    try:
-        # Get credentials
-        creds = get_credentials()
-
-        # Build Gmail service
-        gmail_service = build("gmail", "v1", credentials=creds)
-
-        # Get label ID for the specified label
-        results = gmail_service.users().labels().list(userId="me").execute()
-        labels = results.get("labels", [])
-
-        label_id = None
-        for label in labels:
-            if label["name"] == EMAIL_LABEL:
-                label_id = label["id"]
-                break
-
-        if not label_id:
-            raise Exception(f"Label '{EMAIL_LABEL}' not found in Gmail")
-
-        # Check if Finance sheet exists, if not create it
-        sheets_service = build("sheets", "v4", credentials=creds)
-        try:
-            sheets_service.spreadsheets().values().get(
-                spreadsheetId=SPREADSHEET_ID, range=f"{SHEET_NAME}!A1"
-            ).execute()
-        except Exception:
-            # Create the finance sheet with headers
-            body = {"requests": [{"addSheet": {"properties": {"title": SHEET_NAME}}}]}
-            sheets_service.spreadsheets().batchUpdate(
-                spreadsheetId=SPREADSHEET_ID, body=body
-            ).execute()
-
-            # Add headers
-            sheets_service.spreadsheets().values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"{SHEET_NAME}!A1:E1",
-                valueInputOption="USER_ENTERED",
-                body={
-                    "values": [
-                        ["Date", "Description", "Amount", "Category", "Property"]
-                    ]
-                },
-            ).execute()
-
-        # Get emails with the specified label
-        query = f"label:{EMAIL_LABEL}"
-        results = gmail_service.users().messages().list(userId="me", q=query).execute()
-        messages = results.get("messages", [])
-
-        if not messages:
-            print("No emails found with the specified label")
-            return
-
-        for message in messages:
-            message_id = message["id"]
-
-            # Check if already processed
-            if check_if_processed(creds, message_id):
-                print(f"Skipping already processed email: {message_id}")
-                continue
-
-            try:
-                # Get email content and attachments
-                email_content = get_email_content(gmail_service, message_id)
-
-                # Process with Anthropic
-                json_data = process_with_anthropic(
-                    email_content, email_content["attachments"]
-                )
-
-                # Add to spreadsheet
-                updated_range = add_to_spreadsheet(creds, json_data)
-
-                # Create summary for email
-                # Format the amount with proper sign and 2 decimal places
-                amount = float(json_data.get("amount", 0))
-                formatted_amount = f"${abs(amount):.2f}"
-                if amount < 0:
-                    formatted_amount = f"-{formatted_amount}"
-                else:
-                    formatted_amount = f"+{formatted_amount}"
-
-                summary = f"""
-Transaction Processing Summary:
------------------------------
-Date: {json_data.get('date', 'N/A')}
-Description: {json_data.get('description', 'N/A')}
-Amount: {formatted_amount}
-Category: {json_data.get('category', 'N/A')}
-Property: {json_data.get('property', 'N/A') if json_data.get('property') else 'Not property-related'}
-
-Successfully added to Google Sheets at {updated_range}
-                """
-
-                send_email_summary(
-                    gmail_service,
-                    SENDER_EMAIL,
-                    f"Transaction Processed: {email_content['subject']}",
-                    summary,
-                )
-
-                # Mark as processed in our tracking sheet
-                mark_as_processed(
-                    creds, message_id, email_content["subject"], "Success"
-                )
-
-                # Mark as read in Gmail
-                gmail_service.users().messages().modify(
-                    userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]}
-                ).execute()
-
-                # Clean up temp files
-                for attachment in email_content["attachments"]:
-                    if os.path.exists(attachment["filepath"]):
-                        os.unlink(attachment["filepath"])
-
-            except Exception as e:
-                error_message = f"""
-Transaction Processing Error:
----------------------------
-Subject: {email_content['subject'] if 'email_content' in locals() else 'Unknown'}
-Error: {str(e)}
-
-Please check the email and attachments manually.
-                """
-
-                send_email_summary(
-                    gmail_service,
-                    SENDER_EMAIL,
-                    f"Transaction Processing Error: {email_content['subject'] if 'email_content' in locals() else 'Unknown'}",
-                    error_message,
-                )
-
-                # Mark as processed but with error status
-                if "email_content" in locals():
-                    mark_as_processed(
-                        creds, message_id, email_content["subject"], "Error"
+        except Exception as e:
+            logger.error(f"Error analyzing with Anthropic: {e}")
+            return []
+        finally:
+            # Clean up temporary attachment files
+            for attachment in email_content["attachments"]:
+                try:
+                    os.unlink(attachment["path"])
+                except Exception as e:
+                    logger.error(
+                        f"Error deleting temporary file {attachment['path']}: {e}"
                     )
 
-                # Clean up temp files if they exist
-                if "email_content" in locals() and "attachments" in email_content:
-                    for attachment in email_content["attachments"]:
-                        if os.path.exists(attachment["filepath"]):
-                            os.unlink(attachment["filepath"])
+    def add_to_spreadsheet(self, line_items):
+        """Add the analyzed line items to the Google Sheet."""
+        added_rows = []
+        errors = []
 
-    except Exception as e:
-        print(f"Error in main function: {e}")
+        try:
+            for item in line_items:
+                # Validate and format the data
+                try:
+                    # Convert string date to datetime object for validation
+                    date_obj = datetime.datetime.strptime(item["date"], "%Y-%m-%d")
+                    formatted_date = date_obj.strftime("%Y-%m-%d")
+
+                    # Ensure amount is a float
+                    amount = float(item["amount"])
+
+                    # Prepare row data
+                    row_data = [
+                        formatted_date,
+                        item["description"],
+                        amount,
+                        item["category"],
+                        item.get("property", ""),
+                    ]
+
+                    # Add to spreadsheet
+                    self.worksheet.append_row(row_data)
+                    added_rows.append(row_data)
+
+                except (ValueError, KeyError) as e:
+                    errors.append(f"Error adding item {item}: {str(e)}")
+                    logger.error(f"Error adding item to spreadsheet: {e}")
+
+            return added_rows, errors
+        except Exception as e:
+            logger.error(f"Error updating spreadsheet: {e}")
+            return added_rows, [f"General error updating spreadsheet: {str(e)}"]
+
+    def send_summary_email(self, email_data, added_rows, errors):
+        """Send a summary email with the results."""
+        try:
+            # Set up SMTP connection
+            server = smtplib.SMTP(GMAIL_SMTP_SERVER, GMAIL_SMTP_PORT)
+            server.starttls()
+            server.login(GMAIL_EMAIL, GMAIL_PASSWORD)
+
+            msg = MIMEMultipart()
+            msg["To"] = FORWARDING_EMAIL
+            msg["From"] = GMAIL_EMAIL
+            msg["Subject"] = f"Invoice Processing Summary: {email_data['subject']}"
+
+            email_body = f"""
+            <html>
+            <body>
+            <h2>Invoice Processing Summary</h2>
+            <p><strong>Original Email:</strong> {email_data['subject']}</p>
+            <p><strong>From:</strong> {email_data['sender']}</p>
+            <p><strong>Date:</strong> {email_data['date']}</p>
+            <p><strong>Attachments:</strong> {', '.join([a['filename'] for a in email_data['attachments']])}</p>
+            
+            <h3>Processed Items:</h3>
+            """
+
+            if added_rows:
+                email_body += "<table border='1' cellpadding='5'>"
+                email_body += "<tr><th>Date</th><th>Description</th><th>Amount</th><th>Category</th><th>Property</th></tr>"
+
+                for row in added_rows:
+                    email_body += f"<tr><td>{row[0]}</td><td>{row[1]}</td><td>{row[2]}</td><td>{row[3]}</td><td>{row[4]}</td></tr>"
+
+                email_body += "</table>"
+            else:
+                email_body += "<p>No items were processed.</p>"
+
+            if errors:
+                email_body += "<h3>Errors:</h3><ul>"
+                for error in errors:
+                    email_body += f"<li>{error}</li>"
+                email_body += "</ul>"
+
+            email_body += """
+            </body>
+            </html>
+            """
+
+            msg.attach(MIMEText(email_body, "html"))
+
+            # Send the message
+            server.sendmail(GMAIL_EMAIL, FORWARDING_EMAIL, msg.as_string())
+            server.quit()
+
+            logger.info(f"Summary email sent to {FORWARDING_EMAIL}")
+
+        except Exception as e:
+            logger.error(f"Error sending summary email: {e}")
+
+    def process_emails(self):
+        """Main function to process all unread emails."""
+        result = self.get_unread_emails()
+        if not result or len(result) != 2:
+            logger.info("No unread emails to process or connection failed.")
+            return
+
+        mail, message_ids = result
+
+        try:
+            if not message_ids:
+                logger.info("No unread emails to process.")
+                return
+
+            for message_id in message_ids:
+                logger.info(f"Processing email ID: {message_id}")
+
+                # Get email content
+                email_content = self.get_email_content(mail, message_id)
+                if not email_content:
+                    continue
+
+                # Analyze with Anthropic
+                line_items = self.analyze_with_anthropic(email_content)
+
+                # Add to spreadsheet
+                added_rows, errors = self.add_to_spreadsheet(line_items)
+
+                # Send summary email
+                self.send_summary_email(email_content, added_rows, errors)
+
+                logger.info(f"Completed processing email ID: {email_content['id']}")
+        finally:
+            # Close IMAP connection
+            try:
+                mail.close()
+                mail.logout()
+            except Exception as e:
+                logger.error(f"Error closing IMAP connection: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    processor = InvoiceProcessor()
+    processor.process_emails()

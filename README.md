@@ -2,29 +2,54 @@
 
 ## Instructions
 
-### Install Required Packages
+I'll create a Python script that can accomplish this task. The script will:
 
-```bash
-pip install -r requirements.txt
-```
+Read emails from a Google Group
+Process attachments and email content
+Send these to the Anthropic API for analysis
+Add extracted line items to a Google Sheet
+Forward you a summary of the additions
 
-### Get Google API credentials
+This script is designed to automate your rental property accounting workflow by processing emails from a Google Group and extracting invoice data to your spreadsheet. Here's how it works:
+Setup Requirements
 
-1. Go to Google Cloud Console
-1. Create a new project
-1. Enable both Gmail API and Google Sheets API
-1. Create OAuth credentials (Desktop application)
-1. Download the credentials and save as credentials.json in the same directory as the script
+A Google service account with necessary permissions
+Your Anthropic API key
+A Google Sheet with the requested columns
+Access to the Google Group emails
+The "Google Sheets API" enabled in the Google Cloud workspace
 
-### Set your Anthropic API Key as an environment variable
+Key Features
 
-```bash
-export ANTHROPIC_API_KEY=your_api_key_here
-```
+Retrieves unread emails from your specified Google Group
+Processes email content and attachments
+Uses Anthropic's Claude 3.7 Sonnet model to extract:
 
-### Update the configuration variables
+Date
+Description
+Amount (negative for expenses, positive for income)
+Category
+Property (when specific addresses are mentioned)
 
-- `EMAIL_LABEL`: The Gmail label for invoice emails
-- `SENDER_EMAIL`: Your email address
-- `SPREADSHEET_ID`: ID of your Google Sheet (found in the URL)
-- `SHEET_NAME`: Name of the sheet tab
+
+Adds extracted line items to your Google Sheet
+Sends you a summary email with all processed items or any errors
+
+How to Use
+
+Replace the placeholder values in the configuration section:
+
+SERVICE_ACCOUNT_FILE: Path to your service account JSON file
+GOOGLE_GROUP_EMAIL: Your Google Group email address
+SPREADSHEET_ID: Your Google Sheet ID
+WORKSHEET_NAME: Name of the worksheet
+FORWARDING_EMAIL: Your email for receiving summaries
+ANTHROPIC_API_KEY: Your Anthropic API key
+
+
+Install the required dependencies:
+Copypip install google-api-python-client google-auth-httplib2 google-auth-oauthlib gspread anthropic
+
+Set up a scheduled task to run this script regularly (e.g., daily or hourly)
+
+Would you like me to explain any specific part of the code in more detail?
