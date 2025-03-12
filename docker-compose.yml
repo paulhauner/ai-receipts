@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  ai-receipts:
+    build: .
+    container_name: ai-receipts
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config
+    environment:
+      - CONFIG_PATH=/app/config/config.yaml
+    # Enable logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

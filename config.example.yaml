@@ -1,5 +1,5 @@
 # Service configuration
-service_account_file: "./service-account.json"
+service_account_file: "./config/service-account.json"
 spreadsheet_id: "SPREADSHEET_ID"
 worksheet_name: "Transactions"
 

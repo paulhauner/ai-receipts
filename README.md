@@ -1,5 +1,83 @@
 # ai-receipts
 
+## Running
+
+# Setup and Running Instructions
+
+## Project Structure
+Ensure your project directory is set up like this:
+
+```
+project/
+├── main.py                 # Your Python script
+├── Dockerfile              # Docker configuration
+├── docker-compose.yml      # Docker Compose configuration
+├── requirements.txt        # Python dependencies
+└── config/                 # Configuration directory
+    ├── config.yaml         # Your configuration file
+    └── service-account.json # Google service account credentials
+```
+
+## Configuration Files
+
+1. Place your `config.yaml` and `service-account.json` files in the `config/` directory.
+2. Use `config.example.yaml` as the basis for `config.yaml`.
+
+## Building and Running
+
+### First-time setup:
+
+```bash
+# Create the config directory if it doesn't exist
+mkdir -p config
+
+# Copy your configuration files into the config directory
+cp /path/to/your/config.yaml config/
+cp /path/to/your/service-account.json config/
+
+# Build and start the container
+docker-compose up -d
+```
+
+### Managing the application:
+
+```bash
+# View logs
+docker-compose logs -f
+
+# Stop the application
+docker-compose down
+
+# Restart the application
+docker-compose restart
+```
+
+### Updating the application:
+
+If you make changes to your code:
+
+```bash
+# Rebuild and restart
+docker-compose up -d --build
+```
+
+## Troubleshooting
+
+- If you encounter permissions issues, ensure your configuration files have appropriate read permissions:
+  ```bash
+  chmod 644 config/config.yaml config/service-account.json
+  ```
+
+- To check if the container is running properly:
+  ```bash
+  docker ps
+  ```
+
+- To execute commands inside the container:
+  ```bash
+  docker exec -it invoice-processor bash
+  ```
+
 ## Instructions
 
 I'll create a Python script that can accomplish this task. The script will:

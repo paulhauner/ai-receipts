@@ -1,8 +1,7 @@
-google-api-python-client
-google-auth-httplib2
-google-auth-oauthlib
-gspread
 anthropic
+gspread
+google-auth
+imaplib2
 PyPDF2
 python-docx
-imaplib2
+pyyaml
