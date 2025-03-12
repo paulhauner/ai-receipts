@@ -84,7 +84,7 @@ You can run the app locally with `python main.py`, or use the Docker setup
 described below. Running the project locally requires the same `./config`
 directory as the Docker setup.
 
-### Project Structure
+### Running with Docker
 
 Ensure you create and populate a `config` directory, so your project looks like
 this:
