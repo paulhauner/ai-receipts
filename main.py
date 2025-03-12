@@ -1,13 +1,10 @@
 import os
-import base64
 import email
 import re
 import imaplib2
 from email.header import decode_header
 import anthropic
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 import gspread
 import tempfile
 import smtplib
@@ -19,7 +16,6 @@ import json
 import PyPDF2
 import docx
 import csv
-import io
 import time
 import threading
 
