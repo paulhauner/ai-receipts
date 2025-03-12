@@ -5,3 +5,4 @@ gspread
 anthropic
 PyPDF2
 python-docx
+imaplib2

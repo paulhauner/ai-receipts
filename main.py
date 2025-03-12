@@ -2,7 +2,7 @@ import os
 import base64
 import email
 import re
-import imaplib
+import imaplib2
 from email.header import decode_header
 import anthropic
 from google.oauth2 import service_account
@@ -21,6 +21,7 @@ import docx
 import csv
 import io
 import time
+import threading
 
 # Set up logging
 logging.basicConfig(
@@ -67,11 +68,12 @@ class InvoiceProcessor:
 
         # IMAP connection
         self.mail = None
+        self.idle_event = threading.Event()
 
     def connect_to_gmail(self):
         """Connect to Gmail via IMAP."""
         try:
-            mail = imaplib.IMAP4_SSL(GMAIL_IMAP_SERVER)
+            mail = imaplib2.IMAP4_SSL(GMAIL_IMAP_SERVER)
             mail.login(GMAIL_EMAIL, GMAIL_PASSWORD)
             return mail
         except Exception as e:
@@ -115,7 +117,9 @@ class InvoiceProcessor:
                 return []
 
             message_ids = messages[0].split()
-            logger.info(f"Found {len(message_ids)} unread emails.")
+            count = len(message_ids)
+            if count > 0:
+                logger.info(f"Found {count} unread emails.")
 
             return message_ids
         except Exception as e:
@@ -501,15 +505,22 @@ Format your response as JSON objects in the following structure:
         message_ids = self.get_unread_emails()
 
         if not message_ids:
-            logger.info("No pending unread emails to process.")
             return
 
         for message_id in message_ids:
             self.process_new_message(message_id)
 
+    def idle_callback(self, args):
+        """Callback function for IMAP IDLE events."""
+        response, data, error = args
+        if response == "OK" and data[0].endswith(b"EXISTS"):
+            logger.info("New email notification received via IDLE")
+            return True
+        return False
+
     def listen_for_emails(self):
         """
-        Listen for new emails using IMAP IDLE.
+        Listen for new emails using IMAP IDLE with imaplib2.
         This method will run indefinitely, processing emails as they arrive.
         """
         reconnect_attempts = 0
@@ -537,46 +548,22 @@ Format your response as JSON objects in the following structure:
 
                 logger.info("Starting IMAP IDLE mode, waiting for new emails...")
 
-                while True:
-                    # Start IDLE mode
-                    self.mail.idle()
+                # Reset the event flag
+                self.idle_event.clear()
 
-                    # Wait for notifications from the server
-                    responses = self.mail.idle_check(timeout=IDLE_TIMEOUT)
+                while not self.idle_event.is_set():
+                    # Start IDLE mode with callback
+                    self.mail.idle(callback=self.idle_callback, timeout=IDLE_TIMEOUT)
 
-                    # End IDLE mode
-                    self.mail.idle_done()
+                    # Process new emails if the callback was triggered
+                    self.process_pending_emails()
 
-                    # Check if we received any notifications
-                    if responses:
-                        for response in responses:
-                            # EXISTS response indicates new messages
-                            if len(response) >= 2 and b"EXISTS" in response[1]:
-                                logger.info("New email notification received")
-                                # Get and process all unread messages
-                                self.process_pending_emails()
-
-                    # Send NOOP to keep the connection alive
-                    self.mail.noop()
-                    logger.info("Connection still active (NOOP successful)")
-
-            except imaplib.IMAP4.abort as e:
-                logger.error(f"IMAP connection aborted: {e}")
-                self.cleanup_connection()
-                reconnect_attempts += 1
-                time.sleep(RECONNECT_DELAY)
-
-            except imaplib.IMAP4.error as e:
-                logger.error(f"IMAP error: {e}")
-                self.cleanup_connection()
-                reconnect_attempts += 1
-                time.sleep(RECONNECT_DELAY)
-
-            except (ConnectionResetError, TimeoutError, OSError) as e:
-                logger.error(f"Connection error: {e}")
-                self.cleanup_connection()
-                reconnect_attempts += 1
-                time.sleep(RECONNECT_DELAY)
+                    # Keep connection alive with NOOP
+                    status, data = self.mail.noop()
+                    if status != "OK":
+                        logger.warning("NOOP failed, reconnecting...")
+                        self.cleanup_connection()
+                        break
 
             except Exception as e:
                 logger.error(f"Unexpected error in IDLE loop: {e}")
