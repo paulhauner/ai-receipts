@@ -424,8 +424,7 @@ Format your response as JSON objects in the following structure:
             email_body = f"""
             <html>
             <body>
-            <h2>Invoice Processing Summary</h2>
-            <p><strong>Original Email:</strong> {email_data['subject']}</p>
+            <h2>Invoice Processed 👍</h2>
             <p><strong>From:</strong> {email_data['sender']}</p>
             <p><strong>Date:</strong> {email_data['date']}</p>
             <p><strong>Attachments:</strong> {', '.join([a['filename'] for a in email_data['attachments']])}</p>
@@ -434,6 +433,7 @@ Format your response as JSON objects in the following structure:
             """
 
             if added_rows:
+                email_body += f'<p>Added to the <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}">{WORKSHEET_NAME} sheet<a>.</p>'
                 email_body += "<table border='1' cellpadding='5'>"
                 email_body += "<tr><th>Date</th><th>Description</th><th>Amount</th><th>Category</th><th>Property</th></tr>"
 
