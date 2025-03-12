@@ -53,3 +53,38 @@ Copypip install google-api-python-client google-auth-httplib2 google-auth-oauthl
 Set up a scheduled task to run this script regularly (e.g., daily or hourly)
 
 Would you like me to explain any specific part of the code in more detail?
+
+## Updated for IMAP settings
+
+Updated Gmail Invoice Processor
+Key Changes
+
+IMAP Connection: Now uses Python's imaplib library to connect directly to Gmail's IMAP server
+Authentication: Uses Gmail username and app password instead of service account
+Email Processing: Retrieves and processes unread emails via IMAP protocol
+Email Sending: Uses SMTP protocol to send summary emails from the Gmail account
+Simplified Permissions: Service account is only used for Google Sheets access, not for Gmail
+
+Configuration Updates
+You'll need to configure these new settings:
+
+GMAIL_EMAIL: Your dedicated Gmail account address
+GMAIL_PASSWORD: An app password generated specifically for this application (not your regular Gmail password)
+GMAIL_IMAP_SERVER: Set to 'imap.gmail.com'
+GMAIL_SMTP_SERVER: Set to 'smtp.gmail.com'
+GMAIL_SMTP_PORT: Set to 587 for TLS
+
+Important Notes:
+
+App Password: You'll need to generate an "App Password" in your Google Account settings:
+
+Go to your Google Account → Security → 2-Step Verification → App passwords
+Create a new app password for this script
+
+
+Requirements: You'll need these Python libraries:
+Copypip install imaplib email google-api-python-client google-auth gspread anthropic
+
+Service Account: You still need a service account for Google Sheets access, but with fewer permissions
+
+The rest of the functionality remains the same - the script will still analyze emails with Anthropic, add entries to your Google Sheet, and send you summary emails.

@@ -295,6 +295,13 @@ For each line item you identify, please provide:
 4. Category (e.g., Utilities, Repairs, Rent)
 5. Property (if a specific property address is mentioned)
 
+If there is an item named "Net amount transferred to bank account" or similar,
+please ignore this item. This is a net amount so it doesn't make sense to add
+when you've already added the transactions that generated it.
+
+Some invoices will be related to "47 Market St Strata". Please consider this to
+be a property in of itself.
+
 Format your response as JSON objects in the following structure:
 [
   {
