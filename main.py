@@ -458,16 +458,10 @@ Format your response as JSON objects in the following structure:
             email_body = f"""
             <html>
             <body>
-            <h2>Invoice Processed 👍</h2>
-            <p><strong>From:</strong> {email_data['sender']}</p>
-            <p><strong>Date:</strong> {email_data['date']}</p>
-            <p><strong>Attachments:</strong> {', '.join([a['filename'] for a in email_data['attachments']])}</p>
-            
-            <h3>Processed Items:</h3>
+            <h3>👍 Added to the <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}">Google Sheet<a> ('{WORKSHEET_NAME}' worksheet)</h3>
             """
 
             if added_rows:
-                email_body += f'<p>Added to the <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}">{WORKSHEET_NAME} sheet<a>.</p>'
                 email_body += "<table border='1' cellpadding='5'>"
                 email_body += "<tr><th>Date</th><th>Description</th><th>Amount</th><th>Category</th><th>Property</th></tr>"
 
@@ -476,10 +470,10 @@ Format your response as JSON objects in the following structure:
 
                 email_body += "</table>"
             else:
-                email_body += "<p>No items were processed.</p>"
+                email_body += "<p>🤔 No items were processed.</p>"
 
             if errors:
-                email_body += "<h3>Errors:</h3><ul>"
+                email_body += "<h2>🚨 Errors:</h2><ul>"
                 for error in errors:
                     email_body += f"<li>{error}</li>"
                 email_body += "</ul>"
