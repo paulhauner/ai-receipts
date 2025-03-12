@@ -20,6 +20,7 @@ import PyPDF2
 import docx
 import csv
 import io
+import time
 
 # Set up logging
 logging.basicConfig(
@@ -45,6 +46,9 @@ GMAIL_IMAP_SERVER = "imap.gmail.com"
 GMAIL_SMTP_SERVER = "smtp.gmail.com"
 GMAIL_SMTP_PORT = 587
 FORWARDING_EMAIL = "paul@paulhauner.com"  # Email to forward summaries to
+IDLE_TIMEOUT = 60 * 29  # 29 minutes (most servers have a 30-minute limit)
+MAX_RECONNECT_ATTEMPTS = 5  # Maximum number of attempts to reconnect
+RECONNECT_DELAY = 10  # Seconds to wait between reconnection attempts
 
 
 class InvoiceProcessor:
@@ -61,6 +65,9 @@ class InvoiceProcessor:
         # Set up Anthropic client
         self.anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+        # IMAP connection
+        self.mail = None
+
     def connect_to_gmail(self):
         """Connect to Gmail via IMAP."""
         try:
@@ -71,15 +78,37 @@ class InvoiceProcessor:
             logger.error(f"Error connecting to Gmail: {e}")
             return None
 
+    def process_new_message(self, message_id):
+        """Process a single new email message."""
+        logger.info(f"Processing email ID: {message_id}")
+
+        try:
+            # Get email content
+            email_content = self.get_email_content(self.mail, message_id)
+            if not email_content:
+                return
+
+            # Analyze with Anthropic
+            line_items = self.analyze_with_anthropic(email_content)
+
+            # Add to spreadsheet
+            added_rows, errors = self.add_to_spreadsheet(line_items)
+
+            # Send summary email
+            self.send_summary_email(email_content, added_rows, errors)
+
+            logger.info(f"Completed processing email ID: {email_content['id']}")
+        except Exception as e:
+            logger.error(f"Error processing message {message_id}: {e}")
+
     def get_unread_emails(self):
         """Retrieve unread emails from Gmail."""
-        mail = self.connect_to_gmail()
-        if not mail:
+        if not self.mail:
             return []
 
         try:
-            mail.select("inbox")
-            status, messages = mail.search(None, "UNSEEN")
+            self.mail.select("inbox")
+            status, messages = self.mail.search(None, "UNSEEN")
 
             if status != "OK":
                 logger.error("Error searching for emails")
@@ -88,10 +117,9 @@ class InvoiceProcessor:
             message_ids = messages[0].split()
             logger.info(f"Found {len(message_ids)} unread emails.")
 
-            return mail, message_ids
+            return message_ids
         except Exception as e:
             logger.error(f"Error retrieving emails: {e}")
-            mail.logout()
             return []
 
     def decode_email_header(self, header):
@@ -229,7 +257,9 @@ class InvoiceProcessor:
             mail.store(message_id, "+FLAGS", "\\Seen")
 
             email_data = {
-                "id": message_id.decode(),
+                "id": (
+                    message_id.decode() if isinstance(message_id, bytes) else message_id
+                ),
                 "subject": subject,
                 "sender": sender,
                 "date": date,
@@ -414,7 +444,7 @@ Format your response as JSON objects in the following structure:
             if not email_data["subject"].startswith("Re: "):
                 msg["Subject"] = f"Re: {email_data['subject']}"
             else:
-                msg["Subject"] = {email_data["subject"]}
+                msg["Subject"] = email_data["subject"]
             msg["In-Reply-To"] = email_data["id"]
             if "references" in email_data:
                 msg["References"] = f"{email_data['references']} {email_data['id']}"
@@ -466,47 +496,119 @@ Format your response as JSON objects in the following structure:
         except Exception as e:
             logger.error(f"Error sending summary email: {e}")
 
-    def process_emails(self):
-        """Main function to process all unread emails."""
-        result = self.get_unread_emails()
-        if not result or len(result) != 2:
-            logger.info("No unread emails to process or connection failed.")
+    def process_pending_emails(self):
+        """Process any pending unread emails."""
+        message_ids = self.get_unread_emails()
+
+        if not message_ids:
+            logger.info("No pending unread emails to process.")
             return
 
-        mail, message_ids = result
+        for message_id in message_ids:
+            self.process_new_message(message_id)
 
-        try:
-            if not message_ids:
-                logger.info("No unread emails to process.")
-                return
+    def listen_for_emails(self):
+        """
+        Listen for new emails using IMAP IDLE.
+        This method will run indefinitely, processing emails as they arrive.
+        """
+        reconnect_attempts = 0
 
-            for message_id in message_ids:
-                logger.info(f"Processing email ID: {message_id}")
+        while reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
+            try:
+                # Connect to Gmail
+                logger.info("Connecting to Gmail IMAP server...")
+                self.mail = self.connect_to_gmail()
 
-                # Get email content
-                email_content = self.get_email_content(mail, message_id)
-                if not email_content:
+                if not self.mail:
+                    logger.error("Failed to connect to Gmail. Retrying...")
+                    reconnect_attempts += 1
+                    time.sleep(RECONNECT_DELAY)
                     continue
 
-                # Analyze with Anthropic
-                line_items = self.analyze_with_anthropic(email_content)
+                # Reset reconnect counter on successful connection
+                reconnect_attempts = 0
 
-                # Add to spreadsheet
-                added_rows, errors = self.add_to_spreadsheet(line_items)
+                # Select the inbox
+                self.mail.select("inbox")
 
-                # Send summary email
-                self.send_summary_email(email_content, added_rows, errors)
+                # Process any existing unread emails first
+                self.process_pending_emails()
 
-                logger.info(f"Completed processing email ID: {email_content['id']}")
-        finally:
-            # Close IMAP connection
-            try:
-                mail.close()
-                mail.logout()
+                logger.info("Starting IMAP IDLE mode, waiting for new emails...")
+
+                while True:
+                    # Start IDLE mode
+                    self.mail.idle()
+
+                    # Wait for notifications from the server
+                    responses = self.mail.idle_check(timeout=IDLE_TIMEOUT)
+
+                    # End IDLE mode
+                    self.mail.idle_done()
+
+                    # Check if we received any notifications
+                    if responses:
+                        for response in responses:
+                            # EXISTS response indicates new messages
+                            if len(response) >= 2 and b"EXISTS" in response[1]:
+                                logger.info("New email notification received")
+                                # Get and process all unread messages
+                                self.process_pending_emails()
+
+                    # Send NOOP to keep the connection alive
+                    self.mail.noop()
+                    logger.info("Connection still active (NOOP successful)")
+
+            except imaplib.IMAP4.abort as e:
+                logger.error(f"IMAP connection aborted: {e}")
+                self.cleanup_connection()
+                reconnect_attempts += 1
+                time.sleep(RECONNECT_DELAY)
+
+            except imaplib.IMAP4.error as e:
+                logger.error(f"IMAP error: {e}")
+                self.cleanup_connection()
+                reconnect_attempts += 1
+                time.sleep(RECONNECT_DELAY)
+
+            except (ConnectionResetError, TimeoutError, OSError) as e:
+                logger.error(f"Connection error: {e}")
+                self.cleanup_connection()
+                reconnect_attempts += 1
+                time.sleep(RECONNECT_DELAY)
+
             except Exception as e:
-                logger.error(f"Error closing IMAP connection: {e}")
+                logger.error(f"Unexpected error in IDLE loop: {e}")
+                self.cleanup_connection()
+                reconnect_attempts += 1
+                time.sleep(RECONNECT_DELAY)
+
+        logger.critical(
+            f"Failed to reconnect after {MAX_RECONNECT_ATTEMPTS} attempts. Exiting."
+        )
+
+    def cleanup_connection(self):
+        """Clean up IMAP connection if it exists."""
+        if self.mail:
+            try:
+                self.mail.close()
+                self.mail.logout()
+            except:
+                pass  # Ignore errors during cleanup
+            self.mail = None
 
 
 if __name__ == "__main__":
     processor = InvoiceProcessor()
-    processor.process_emails()
+
+    try:
+        logger.info("Starting Invoice Processor with IMAP IDLE monitoring")
+        processor.listen_for_emails()
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt, shutting down...")
+        processor.cleanup_connection()
+        logger.info("Invoice Processor shut down gracefully")
+    except Exception as e:
+        logger.critical(f"Fatal error: {e}")
+        processor.cleanup_connection()
