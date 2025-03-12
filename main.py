@@ -18,6 +18,7 @@ import docx
 import csv
 import time
 import threading
+import yaml
 
 # Set up logging
 logging.basicConfig(
@@ -25,42 +26,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
-SERVICE_ACCOUNT_FILE = (
-    "./credentials/service-account.json"  # Path to your service account credentials
-)
-GOOGLE_GROUP_EMAIL = "ai-receipts@paulhauner.com"  # Your Google Group email
-SPREADSHEET_ID = "1oM5APBsN7JqADj71VHLp14BVwaOd5Azx9g3m_Cm5B8M"  # Google Sheet ID
-WORKSHEET_NAME = "Transactions"  # Name of the worksheet
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # Anthropic API key
 
-# Gmail IMAP configuration
-GMAIL_EMAIL = "haunereceipts@gmail.com"  # Your dedicated Gmail account
-GMAIL_PASSWORD = os.environ.get(
-    "GMAIL_APP_PASSWORD"
-)  # App password for Gmail (not your regular password)
-GMAIL_IMAP_SERVER = "imap.gmail.com"
-GMAIL_SMTP_SERVER = "smtp.gmail.com"
-GMAIL_SMTP_PORT = 587
-FORWARDING_EMAIL = "paul@paulhauner.com"  # Email to forward summaries to
-IDLE_TIMEOUT = 60 * 29  # 29 minutes (most servers have a 30-minute limit)
-MAX_RECONNECT_ATTEMPTS = 5  # Maximum number of attempts to reconnect
-RECONNECT_DELAY = 10  # Seconds to wait between reconnection attempts
+def load_config():
+    """Load configuration from YAML file."""
+    config_path = os.environ.get("CONFIG_PATH", "./config.yaml")
+    try:
+        with open(config_path, "r") as config_file:
+            config = yaml.safe_load(config_file)
+        logger.info(f"Configuration loaded from {config_path}")
+        return config
+    except Exception as e:
+        logger.error(f"Error loading configuration: {e}")
+        raise
 
 
 class InvoiceProcessor:
     def __init__(self):
+        # Load configuration
+        self.config = load_config()
+
         # Set up Google Sheets access via service account
         self.credentials = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE,
+            self.config["service_account_file"],
             scopes=["https://www.googleapis.com/auth/spreadsheets"],
         )
         self.gc = gspread.authorize(self.credentials)
-        self.spreadsheet = self.gc.open_by_key(SPREADSHEET_ID)
-        self.worksheet = self.spreadsheet.worksheet(WORKSHEET_NAME)
+        self.spreadsheet = self.gc.open_by_key(self.config["spreadsheet_id"])
+        self.worksheet = self.spreadsheet.worksheet(self.config["worksheet_name"])
 
         # Set up Anthropic client
-        self.anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.anthropic_client = anthropic.Anthropic(
+            api_key=self.config["anthropic_api_key"]
+        )
 
         # IMAP connection
         self.mail = None
@@ -69,8 +66,8 @@ class InvoiceProcessor:
     def connect_to_gmail(self):
         """Connect to Gmail via IMAP."""
         try:
-            mail = imaplib2.IMAP4_SSL(GMAIL_IMAP_SERVER)
-            mail.login(GMAIL_EMAIL, GMAIL_PASSWORD)
+            mail = imaplib2.IMAP4_SSL(self.config["gmail_imap_server"])
+            mail.login(self.config["gmail_email"], self.config["gmail_app_password"])
             return mail
         except Exception as e:
             logger.error(f"Error connecting to Gmail: {e}")
@@ -306,6 +303,7 @@ class InvoiceProcessor:
                     )
 
             # Prepare the prompt for Anthropic with email content
+            additional_prompt = self.config["additional_prompt"]
             prompt = f"""
 I need you to analyze this email and any attachments related to rental property invoices or statements.
 Extract line items and categorize them appropriately for accounting purposes.
@@ -330,13 +328,6 @@ For each line item you identify, please provide:
 4. Category (e.g., Utilities, Repairs, Rent)
 5. Property (if a specific property address is mentioned)
 
-If there is an item named "Net amount transferred to bank account" or similar,
-please ignore this item. This is a net amount so it doesn't make sense to add
-when you've already added the transactions that generated it.
-
-Some invoices will be related to "47 Market St Strata". Please consider this to
-be a property in of itself.
-
 Format your response as JSON objects in the following structure:
 [
   {
@@ -349,15 +340,17 @@ Format your response as JSON objects in the following structure:
 ]
 """
 
+            prompt += f"\n\n{additional_prompt}"
+
             # Log prompt size for debugging
             logger.info(f"Prompt size: {len(prompt)} characters")
 
             # Call Anthropic API
             response = self.anthropic_client.messages.create(
-                model="claude-3-7-sonnet-20250219",
-                max_tokens=4000,
-                temperature=0,
-                system="You are an expert accountant specialized in processing rental property invoices and statements. Extract line items accurately, following the format instructions exactly.",
+                model=self.config["anthropic_model"],
+                max_tokens=self.config["max_tokens"],
+                temperature=self.config["temperature"],
+                system=self.config["system_prompt"],
                 messages=[{"role": "user", "content": prompt}],
             )
 
@@ -434,13 +427,15 @@ Format your response as JSON objects in the following structure:
         """Send a summary email with the results."""
         try:
             # Set up SMTP connection
-            server = smtplib.SMTP(GMAIL_SMTP_SERVER, GMAIL_SMTP_PORT)
+            server = smtplib.SMTP(
+                self.config["gmail_smtp_server"], self.config["gmail_smtp_port"]
+            )
             server.starttls()
-            server.login(GMAIL_EMAIL, GMAIL_PASSWORD)
+            server.login(self.config["gmail_email"], self.config["gmail_app_password"])
 
             msg = MIMEMultipart()
-            msg["To"] = FORWARDING_EMAIL
-            msg["From"] = GMAIL_EMAIL
+            msg["To"] = self.config["forwarding_email"]
+            msg["From"] = self.config["gmail_email"]
             if not email_data["subject"].startswith("Re: "):
                 msg["Subject"] = f"Re: {email_data['subject']}"
             else:
@@ -454,15 +449,19 @@ Format your response as JSON objects in the following structure:
             email_body = f"""
             <html>
             <body>
-            <h3>👍 Added to the <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}">Google Sheet<a> ('{WORKSHEET_NAME}' worksheet)</h3>
             """
 
             if added_rows:
+                email_body += f"""
+                <h3>👍 Added to the <a href="https://docs.google.com/spreadsheets/d/{self.config["spreadsheet_id"]}">Google Sheet<a> ('{self.config["worksheet_name"]}' worksheet)</h3>
+                """
                 email_body += "<table border='1' cellpadding='5'>"
-                email_body += "<tr><th>Date</th><th>Description</th><th>Amount</th><th>Category</th><th>Property</th></tr>"
+                email_body += "<tr><th>Date</th><th>Description</th><th>Amount</th>\
+                    <th>Category</th><th>Property</th></tr>"
 
                 for row in added_rows:
-                    email_body += f"<tr><td>{row[0]}</td><td>{row[1]}</td><td>{row[2]}</td><td>{row[3]}</td><td>{row[4]}</td></tr>"
+                    email_body += f"<tr><td>{row[0]}</td><td>{row[1]}</td>\
+                        <td>{row[2]}</td><td>{row[3]}</td><td>{row[4]}</td></tr>"
 
                 email_body += "</table>"
             else:
@@ -482,10 +481,14 @@ Format your response as JSON objects in the following structure:
             msg.attach(MIMEText(email_body, "html"))
 
             # Send the message
-            server.sendmail(GMAIL_EMAIL, FORWARDING_EMAIL, msg.as_string())
+            server.sendmail(
+                self.config["gmail_email"],
+                self.config["forwarding_email"],
+                msg.as_string(),
+            )
             server.quit()
 
-            logger.info(f"Summary email sent to {FORWARDING_EMAIL}")
+            logger.info(f"Summary email sent to {self.config['forwarding_email']}")
 
         except Exception as e:
             logger.error(f"Error sending summary email: {e}")
@@ -515,7 +518,7 @@ Format your response as JSON objects in the following structure:
         """
         reconnect_attempts = 0
 
-        while reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
+        while reconnect_attempts < self.config["max_reconnect_attempts"]:
             try:
                 # Connect to Gmail
                 logger.info("Connecting to Gmail IMAP server...")
@@ -524,7 +527,7 @@ Format your response as JSON objects in the following structure:
                 if not self.mail:
                     logger.error("Failed to connect to Gmail. Retrying...")
                     reconnect_attempts += 1
-                    time.sleep(RECONNECT_DELAY)
+                    time.sleep(self.config["reconnect_delay"])
                     continue
 
                 # Reset reconnect counter on successful connection
@@ -543,7 +546,9 @@ Format your response as JSON objects in the following structure:
 
                 while not self.idle_event.is_set():
                     # Start IDLE mode with callback
-                    self.mail.idle(callback=self.idle_callback, timeout=IDLE_TIMEOUT)
+                    self.mail.idle(
+                        callback=self.idle_callback, timeout=self.config["idle_timeout"]
+                    )
 
                     # Process new emails if the callback was triggered
                     self.process_pending_emails()
@@ -559,10 +564,10 @@ Format your response as JSON objects in the following structure:
                 logger.error(f"Unexpected error in IDLE loop: {e}")
                 self.cleanup_connection()
                 reconnect_attempts += 1
-                time.sleep(RECONNECT_DELAY)
+                time.sleep(self.config["reconnect_delay"])
 
         logger.critical(
-            f"Failed to reconnect after {MAX_RECONNECT_ATTEMPTS} attempts. Exiting."
+            f"Failed to reconnect after {self.config['max_reconnect_attempts']} attempts. Exiting."
         )
 
     def cleanup_connection(self):

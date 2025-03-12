@@ -1,0 +1,30 @@
+# Service configuration
+service_account_file: "./service-account.json"
+spreadsheet_id: "SPREADSHEET_ID"
+worksheet_name: "Transactions"
+
+# API keys
+anthropic_api_key: "sk-ant..."  # Obtained from the Anthropic console.
+
+# Gmail configuration
+gmail_email: "receipts@example.com"
+gmail_app_password: "abcd efgh ijkl mnop"  # Will be loaded from environment variable
+gmail_imap_server: "imap.gmail.com"
+gmail_smtp_server: "smtp.gmail.com"
+gmail_smtp_port: 587
+forwarding_email: "user@example.com"
+
+# Connection settings
+idle_timeout: 1740  # 29 minutes (most servers have a 30-minute limit)
+max_reconnect_attempts: 5
+reconnect_delay: 10
+
+# Anthropic API settings
+anthropic_model: "claude-3-7-sonnet-20250219"
+max_tokens: 38400
+temperature: 0
+system_prompt: "You are an expert accountant specialized in processing rental property invoices and statements. Extract line items accurately, following the format instructions exactly."
+additional_prompt: |
+  If there is an item named "Net amount transferred to bank account" or similar,
+  please ignore this item. This is a net amount so it doesn't make sense to add
+  when you've already added the transactions that generated it.
