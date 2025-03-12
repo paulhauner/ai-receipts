@@ -228,7 +228,7 @@ class InvoiceProcessor:
             # Mark the message as read
             mail.store(message_id, "+FLAGS", "\\Seen")
 
-            return {
+            email_data = {
                 "id": message_id.decode(),
                 "subject": subject,
                 "sender": sender,
@@ -236,6 +236,11 @@ class InvoiceProcessor:
                 "body": body_content,
                 "attachments": attachments,
             }
+
+            if "References" in email_message:
+                email_data["references"] = email_message["References"]
+
+            return email_data
         except Exception as e:
             logger.error(f"Error processing email {message_id}: {e}")
             return None
@@ -406,7 +411,15 @@ Format your response as JSON objects in the following structure:
             msg = MIMEMultipart()
             msg["To"] = FORWARDING_EMAIL
             msg["From"] = GMAIL_EMAIL
-            msg["Subject"] = f"Invoice Processing Summary: {email_data['subject']}"
+            if not email_data["subject"].startswith("Re: "):
+                msg["Subject"] = f"Re: {email_data['subject']}"
+            else:
+                msg["Subject"] = {email_data["subject"]}
+            msg["In-Reply-To"] = email_data["id"]
+            if "references" in email_data:
+                msg["References"] = f"{email_data['references']} {email_data['id']}"
+            else:
+                msg["References"] = email_data["id"]
 
             email_body = f"""
             <html>
