@@ -87,13 +87,13 @@ class InvoiceProcessor:
                 return
 
             # Analyze with Anthropic
-            line_items = self.analyze_with_anthropic(email_content)
+            line_items, llm_error = self.analyze_with_anthropic(email_content)
 
             # Add to spreadsheet
             added_rows, errors = self.add_to_spreadsheet(line_items)
 
             # Send summary email
-            self.send_summary_email(email_content, added_rows, errors)
+            self.send_summary_email(email_content, added_rows, errors, llm_error)
 
             logger.info(f"Completed processing email ID: {email_content['id']}")
         except Exception as e:
@@ -492,19 +492,20 @@ Format your response as JSON objects in the following structure:
             if json_match:
                 try:
                     line_items = json.loads(json_match.group(0))
-                    return line_items
+                    return line_items, None
                 except json.JSONDecodeError:
-                    logger.error("Could not parse JSON from Anthropic response")
-                    logger.error(f"Raw response text: {response.content[0].text}")
-                    return []
+                    error_msg = f"Could not parse JSON from Anthropic response. Raw response: {response.content[0].text}"
+                    logger.error(error_msg)
+                    return [], error_msg
             else:
-                logger.error("No JSON data found in Anthropic response")
-                logger.error(f"Raw response text: {response.content[0].text}")
-                return []
+                error_msg = f"No JSON data found in Anthropic response. Raw response: {response.content[0].text}"
+                logger.error(error_msg)
+                return [], error_msg
 
         except Exception as e:
-            logger.error(f"Error analyzing with Anthropic: {e}")
-            return []
+            error_msg = f"Error analyzing with Anthropic: {e}"
+            logger.error(error_msg)
+            return [], error_msg
 
     def add_to_spreadsheet(self, line_items):
         """Add the analyzed line items to the Google Sheet."""
@@ -544,7 +545,7 @@ Format your response as JSON objects in the following structure:
             logger.error(f"Error updating spreadsheet: {e}")
             return added_rows, [f"General error updating spreadsheet: {str(e)}"]
 
-    def send_summary_email(self, email_data, added_rows, errors):
+    def send_summary_email(self, email_data, added_rows, errors, llm_error=None):
         """Send a summary email with the results."""
         try:
             # Set up SMTP connection
@@ -587,6 +588,11 @@ Format your response as JSON objects in the following structure:
                 email_body += "</table>"
             else:
                 email_body += "<p>🤔 No items were processed.</p>"
+                
+                # Add LLM error message if there was one
+                if llm_error:
+                    email_body += "<h3>📝 Response from LLM:</h3>"
+                    email_body += f"<pre style='background-color: #f5f5f5; padding: 10px; border-radius: 5px; white-space: pre-wrap;'>{llm_error}</pre>"
 
             if errors:
                 email_body += "<h2>🚨 Errors:</h2><ul>"
