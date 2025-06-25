@@ -10,6 +10,7 @@ import tempfile
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
 import logging
 import datetime
 import json
@@ -19,6 +20,8 @@ import csv
 import time
 import threading
 import yaml
+import requests
+from urllib.parse import urlparse
 
 # Set up logging
 logging.basicConfig(
@@ -95,6 +98,14 @@ class InvoiceProcessor:
             logger.info(f"Completed processing email ID: {email_content['id']}")
         except Exception as e:
             logger.error(f"Error processing message {message_id}: {e}")
+        finally:
+            # Clean up temporary attachment files
+            if 'email_content' in locals() and email_content:
+                for attachment in email_content.get("attachments", []):
+                    try:
+                        os.unlink(attachment["path"])
+                    except Exception as e:
+                        logger.error(f"Error deleting temporary file {attachment['path']}: {e}")
 
     def get_unread_emails(self):
         """Retrieve unread emails from Gmail."""
@@ -132,6 +143,101 @@ class InvoiceProcessor:
             else:
                 header_parts.append(content)
         return "".join(header_parts)
+
+    def find_pdf_urls(self, text):
+        """Find PDF URLs in email text, including HTML links."""
+        urls = []
+        
+        # First, extract URLs from HTML href attributes
+        href_pattern = r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([^<]*(?:\.pdf|invoice|statement|receipt|document)[^<]*)</a>'
+        html_matches = re.findall(href_pattern, text, re.IGNORECASE)
+        for url, link_text in html_matches:
+            logger.info(f"Found HTML link: '{link_text}' -> {url}")
+            urls.append(url)
+        
+        # Also try to extract just href URLs without requiring specific link text
+        simple_href_pattern = r'href=["\']([^"\']+)["\']'
+        href_urls = re.findall(simple_href_pattern, text, re.IGNORECASE)
+        for url in href_urls:
+            # Only include if it looks like it could be a document
+            if any(keyword in url.lower() for keyword in ['document', 'statement', 'invoice', 'receipt', 'download', 'file', 'attachment']):
+                logger.info(f"Found potential document URL in href: {url}")
+                urls.append(url)
+        
+        # Pattern to match URLs that end with .pdf or contain pdf in the path
+        pdf_url_patterns = [
+            r'https?://[^\s<>"]+\.pdf(?:\?[^\s<>"]*)?',  # URLs ending with .pdf
+            r'https?://[^\s<>"]*[/\?&]pdf[/\?&][^\s<>"]*',  # URLs with pdf in path
+            r'https?://[^\s<>"]*(?:document|statement|invoice|receipt|download|file|attachment)[^\s<>"]*',  # Document-related URLs
+        ]
+        
+        for pattern in pdf_url_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            urls.extend(matches)
+        
+        # Remove duplicates while preserving order
+        unique_urls = []
+        for url in urls:
+            if url not in unique_urls:
+                unique_urls.append(url)
+        
+        logger.info(f"All detected URLs: {unique_urls}")
+        return unique_urls
+
+    def download_pdf_from_url(self, url):
+        """Download PDF from URL and save to temporary file."""
+        try:
+            logger.info(f"Downloading PDF from URL: {url}")
+            
+            # Set up headers to mimic a browser request
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            # Download the file with timeout
+            response = requests.get(url, headers=headers, timeout=30, stream=True)
+            response.raise_for_status()
+            
+            # Check if the response might be a PDF (be more lenient)
+            content_type = response.headers.get('content-type', '').lower()
+            content_length = response.headers.get('content-length', '0')
+            logger.info(f"Downloaded content: type={content_type}, length={content_length} bytes")
+            
+            # Be more lenient - many document servers don't set correct content-type
+            if 'html' in content_type and int(content_length or 0) < 10000:
+                logger.warning(f"URL {url} returned HTML content, likely not a direct document link")
+                return None
+            
+            # Create temporary file with .pdf extension
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+            
+            # Download in chunks to handle large files
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    temp_file.write(chunk)
+            
+            temp_file.close()
+            
+            # Generate a filename from the URL
+            parsed_url = urlparse(url)
+            filename = os.path.basename(parsed_url.path)
+            if not filename or not filename.endswith('.pdf'):
+                filename = f"downloaded_pdf_{int(time.time())}.pdf"
+            
+            logger.info(f"Successfully downloaded PDF: {filename}")
+            return {
+                'filename': filename,
+                'path': temp_file.name,
+                'mime_type': 'application/pdf',
+                'source_url': url
+            }
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error downloading PDF from {url}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error downloading PDF from {url}: {e}")
+            return None
 
     def extract_text_from_attachment(self, file_path, mime_type):
         """Extract text from various file types."""
@@ -201,6 +307,7 @@ class InvoiceProcessor:
             # Process email body and attachments
             body_content = ""
             attachments = []
+            downloaded_pdfs = []
 
             if email_message.is_multipart():
                 for part in email_message.walk():
@@ -208,14 +315,16 @@ class InvoiceProcessor:
                     content_disposition = str(part.get("Content-Disposition"))
 
                     if (
-                        content_type == "text/plain"
+                        content_type in ["text/plain", "text/html"]
                         and "attachment" not in content_disposition
                     ):
-                        # Get the email body
+                        # Get the email body (both plain text and HTML)
                         try:
                             body = part.get_payload(decode=True)
                             charset = part.get_content_charset() or "utf-8"
-                            body_content += body.decode(charset, errors="replace")
+                            decoded_body = body.decode(charset, errors="replace")
+                            body_content += decoded_body + "\n\n"
+                            logger.debug(f"Added {content_type} content, length: {len(decoded_body)}")
                         except Exception as e:
                             logger.error(f"Error decoding email body: {e}")
 
@@ -250,6 +359,26 @@ class InvoiceProcessor:
                 except Exception as e:
                     logger.error(f"Error decoding email body: {e}")
 
+            # Look for PDF URLs in the email body and download them as attachments
+            if body_content:
+                logger.info(f"Scanning email body for PDF URLs. Body length: {len(body_content)} chars")
+                logger.debug(f"Email body content preview: {body_content[:500]}...")
+                pdf_urls = self.find_pdf_urls(body_content)
+                if pdf_urls:
+                    logger.info(f"Found {len(pdf_urls)} PDF URLs in email body: {pdf_urls}")
+                    for url in pdf_urls:
+                        downloaded_pdf = self.download_pdf_from_url(url)
+                        if downloaded_pdf:
+                            downloaded_pdfs.append(downloaded_pdf)
+                            attachments.append(downloaded_pdf)
+                            logger.info(f"Added downloaded PDF as attachment: {downloaded_pdf['filename']}")
+                        else:
+                            logger.warning(f"Failed to download PDF from URL: {url}")
+                else:
+                    logger.info("No PDF URLs found in email body")
+            else:
+                logger.warning("Email body is empty, cannot search for PDF URLs")
+
             # Mark the message as read
             mail.store(message_id, "+FLAGS", "\\Seen")
 
@@ -262,6 +391,7 @@ class InvoiceProcessor:
                 "date": date,
                 "body": body_content,
                 "attachments": attachments,
+                "downloaded_pdfs": downloaded_pdfs,
             }
 
             if "References" in email_message:
@@ -375,15 +505,6 @@ Format your response as JSON objects in the following structure:
         except Exception as e:
             logger.error(f"Error analyzing with Anthropic: {e}")
             return []
-        finally:
-            # Clean up temporary attachment files
-            for attachment in email_content["attachments"]:
-                try:
-                    os.unlink(attachment["path"])
-                except Exception as e:
-                    logger.error(
-                        f"Error deleting temporary file {attachment['path']}: {e}"
-                    )
 
     def add_to_spreadsheet(self, line_items):
         """Add the analyzed line items to the Google Sheet."""
@@ -479,6 +600,23 @@ Format your response as JSON objects in the following structure:
             """
 
             msg.attach(MIMEText(email_body, "html"))
+
+            # Attach downloaded PDFs to the email
+            downloaded_pdfs = email_data.get("downloaded_pdfs", [])
+            if downloaded_pdfs:
+                logger.info(f"Attaching {len(downloaded_pdfs)} downloaded PDFs to reply email")
+                for pdf in downloaded_pdfs:
+                    try:
+                        with open(pdf["path"], "rb") as f:
+                            pdf_attachment = MIMEApplication(f.read(), _subtype="pdf")
+                            pdf_attachment.add_header(
+                                "Content-Disposition", 
+                                f"attachment; filename={pdf['filename']}"
+                            )
+                            msg.attach(pdf_attachment)
+                            logger.info(f"Attached PDF: {pdf['filename']}")
+                    except Exception as e:
+                        logger.error(f"Error attaching PDF {pdf['filename']}: {e}")
 
             # Send the message
             server.sendmail(
