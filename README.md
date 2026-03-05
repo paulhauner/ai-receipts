@@ -105,6 +105,14 @@ project/
 1. Place your `config.yaml` and `service-account.json` files in the `config/` directory.
 2. Use `config.example.yaml` as the basis for `config.yaml`.
 
+### Anthropic Model Configuration
+
+To avoid breakage from retired dated model snapshots:
+
+- Set `anthropic_model` to a rolling alias (for example `claude-sonnet-4-5`).
+- Optionally set `anthropic_model_fallbacks` to one or more backup model IDs.
+- Optionally set `anthropic_model_family` (`sonnet`, `haiku`, or `opus`) to auto-discover a replacement if all configured models are unavailable.
+
 ### Building and Running
 
 #### Startup:

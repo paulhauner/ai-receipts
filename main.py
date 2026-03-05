@@ -402,6 +402,104 @@ class InvoiceProcessor:
             logger.error(f"Error processing email {message_id}: {e}")
             return None
 
+    def _get_model_candidates(self):
+        """Return de-duplicated list of configured Anthropic model IDs."""
+        candidates = []
+
+        primary_model = self.config.get("anthropic_model", "")
+        if isinstance(primary_model, str) and primary_model.strip():
+            candidates.append(primary_model.strip())
+
+        fallback_models = self.config.get("anthropic_model_fallbacks", [])
+        if isinstance(fallback_models, str):
+            fallback_models = [fallback_models]
+
+        if isinstance(fallback_models, list):
+            for model in fallback_models:
+                if isinstance(model, str) and model.strip():
+                    candidates.append(model.strip())
+
+        # De-duplicate while preserving order.
+        return list(dict.fromkeys(candidates))
+
+    def _discover_latest_model_for_family(self, family):
+        """
+        Discover the latest model in a family (sonnet/haiku/opus) via Anthropic Models API.
+        """
+        endpoint = self.config.get(
+            "anthropic_models_endpoint", "https://api.anthropic.com/v1/models"
+        )
+        api_version = self.config.get("anthropic_api_version", "2023-06-01")
+
+        headers = {
+            "x-api-key": self.config["anthropic_api_key"],
+            "anthropic-version": api_version,
+        }
+
+        try:
+            response = requests.get(endpoint, headers=headers, timeout=30)
+            response.raise_for_status()
+            payload = response.json()
+            models = payload.get("data", [])
+
+            family_token = f"-{family.lower()}-"
+            matching = []
+            for model in models:
+                model_id = model.get("id")
+                if isinstance(model_id, str) and family_token in model_id.lower():
+                    matching.append(model)
+
+            if not matching:
+                logger.warning(
+                    f"No Anthropic models found for family '{family}' via {endpoint}"
+                )
+                return None
+
+            def sort_key(model):
+                model_id = model.get("id", "")
+                created_at = model.get("created_at")
+                created_ts = -1.0
+                if isinstance(created_at, str):
+                    try:
+                        created_ts = datetime.datetime.fromisoformat(
+                            created_at.replace("Z", "+00:00")
+                        ).timestamp()
+                    except ValueError:
+                        pass
+                return (created_ts, model_id)
+
+            latest_model = sorted(matching, key=sort_key, reverse=True)[0].get("id")
+            logger.info(
+                f"Auto-discovered latest '{family}' model from Anthropic: {latest_model}"
+            )
+            return latest_model
+        except Exception as e:
+            logger.warning(
+                f"Could not auto-discover Anthropic model for family '{family}': {e}"
+            )
+            return None
+
+    def _parse_anthropic_response(self, response_text):
+        """Parse Anthropic text response and extract line items as JSON."""
+        json_match = re.search(r"\[\s*\{.*?\}\s*\]", response_text, re.DOTALL)
+        if not json_match:
+            error_msg = (
+                f"No JSON data found in Anthropic response. Raw response: {response_text}"
+            )
+            logger.error(error_msg)
+            return [], error_msg
+
+        try:
+            line_items = json.loads(json_match.group(0))
+            return line_items, None
+        except json.JSONDecodeError:
+            error_msg = (
+                "Could not parse JSON from Anthropic response. "
+                f"Raw response: {response_text}"
+            )
+            logger.error(error_msg)
+            return [], error_msg
+
     def analyze_with_anthropic(self, email_content):
         """Send email content and attachments to Anthropic API for analysis."""
         try:
@@ -475,32 +573,68 @@ Format your response as JSON objects in the following structure:
             # Log prompt size for debugging
             logger.info(f"Prompt size: {len(prompt)} characters")
 
-            # Call Anthropic API
-            response = self.anthropic_client.messages.create(
-                model=self.config["anthropic_model"],
-                max_tokens=self.config["max_tokens"],
-                temperature=self.config["temperature"],
-                system=self.config["system_prompt"],
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            # Extract the JSON part from the response
-            # Attempt to find a JSON array in the response
-            json_match = re.search(
-                r"\[\s*\{.*?\}\s*\]", response.content[0].text, re.DOTALL
-            )
-            if json_match:
-                try:
-                    line_items = json.loads(json_match.group(0))
-                    return line_items, None
-                except json.JSONDecodeError:
-                    error_msg = f"Could not parse JSON from Anthropic response. Raw response: {response.content[0].text}"
-                    logger.error(error_msg)
-                    return [], error_msg
-            else:
-                error_msg = f"No JSON data found in Anthropic response. Raw response: {response.content[0].text}"
+            model_candidates = self._get_model_candidates()
+            if not model_candidates:
+                error_msg = (
+                    "No Anthropic model configured. Set anthropic_model in config.yaml."
+                )
                 logger.error(error_msg)
                 return [], error_msg
+
+            attempted_models = []
+
+            for model in model_candidates:
+                attempted_models.append(model)
+                try:
+                    logger.info(f"Calling Anthropic with model: {model}")
+                    response = self.anthropic_client.messages.create(
+                        model=model,
+                        max_tokens=self.config["max_tokens"],
+                        temperature=self.config["temperature"],
+                        system=self.config["system_prompt"],
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    return self._parse_anthropic_response(response.content[0].text)
+                except anthropic.NotFoundError as e:
+                    logger.warning(
+                        f"Configured Anthropic model not found ({model}). Trying next candidate. Error: {e}"
+                    )
+                    continue
+
+            # Optional family auto-discovery, used after configured models fail.
+            family = self.config.get("anthropic_model_family")
+            if isinstance(family, str) and family.strip():
+                discovered_model = self._discover_latest_model_for_family(
+                    family.strip().lower()
+                )
+                if discovered_model and discovered_model not in attempted_models:
+                    attempted_models.append(discovered_model)
+                    try:
+                        logger.info(
+                            f"Retrying with auto-discovered Anthropic model: {discovered_model}"
+                        )
+                        response = self.anthropic_client.messages.create(
+                            model=discovered_model,
+                            max_tokens=self.config["max_tokens"],
+                            temperature=self.config["temperature"],
+                            system=self.config["system_prompt"],
+                            messages=[{"role": "user", "content": prompt}],
+                        )
+                        return self._parse_anthropic_response(response.content[0].text)
+                    except Exception as e:
+                        error_msg = (
+                            "Error analyzing with Anthropic after auto-discovery "
+                            f"({discovered_model}): {e}"
+                        )
+                        logger.error(error_msg)
+                        return [], error_msg
+
+            error_msg = (
+                "Error analyzing with Anthropic: no configured model was available. "
+                f"Tried: {', '.join(attempted_models)}"
+            )
+            logger.error(error_msg)
+            return [], error_msg
 
         except Exception as e:
             error_msg = f"Error analyzing with Anthropic: {e}"
